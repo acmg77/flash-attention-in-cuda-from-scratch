@@ -81,8 +81,26 @@ __device__ float dot_product(const float* a, const float* b, int n) {
     return sum;
 }
 
-# Step 7 - matmul (not yet solved)
-# TODO: implement
+# Step 7 - matmul
+__global__ void matmul(const float* a, const float* b, float* c, int m, int k, int n) {
+    // TODO: compute C = A * B for row-major matrices
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Grid-stride: total number of threads in the grid
+    int stride = gridDim.x * blockDim.x;
+
+    int num = m*n;
+    for(int i = gid;i<num;i+=stride){
+        int col = i%n;
+        int row = i/n;
+        float sum = 0.0f;
+        for(int c = 0;c<k;++c){
+            sum+=a[row*k+c]*b[c*n+col];
+        }
+        c[i] = sum;
+
+    }
+}
 
 # Step 8 - transpose (not yet solved)
 # TODO: implement
