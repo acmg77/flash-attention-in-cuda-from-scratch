@@ -121,8 +121,30 @@ __global__ void transpose(const float* in, float* out, int rows, int cols) {
 
 }
 
-# Step 9 - qk_scores (not yet solved)
-# TODO: implement
+# Step 9 - qk_scores
+__global__ void qk_scores(const float* q, const float* k, float* scores, int seq_len, int head_dim) {
+    // TODO: compute scores[i, j] = dot(q_row_i, k_row_j) / sqrt(head_dim)
+    // int scale = 1.0/sqrt(head_dim);
+    int j = blockIdx.x * blockDim.x + threadIdx.x; // 输出矩阵的列索引
+    int i = blockIdx.y * blockDim.y + threadIdx.y; // 输出矩阵的行索引
+
+    // 2. 边界检查，防止越界访问 (输出矩阵的形状是 seq_len x seq_len)
+    if (i < seq_len && j < seq_len) {
+        
+        // 3. 计算缩放因子 (注意这里必须是 float 类型，并且推荐用 sqrtf 计算单精度)
+        float scale = 1.0f / sqrtf((float)head_dim);
+
+        // 4. 定位 Q 和 K 中对应行的起始指针
+        // 矩阵是行优先 (row-major) 存储的，形状为 (seq_len, head_dim)
+        const float* q_row_i = q + i * head_dim;
+        const float* k_row_j = k + j * head_dim;
+
+        // 5. 调用外部的 dot_product 计算点积，并乘上缩放因子，写入输出矩阵
+        // 输出矩阵 scores 也是行优先存储，形状为 (seq_len, seq_len)
+        scores[i * seq_len + j] = dot_product(q_row_i, k_row_j, head_dim) * scale;
+    }
+
+}
 
 # Step 10 - softmax_rows (not yet solved)
 # TODO: implement
