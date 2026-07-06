@@ -146,8 +146,35 @@ __global__ void qk_scores(const float* q, const float* k, float* scores, int seq
 
 }
 
-# Step 10 - softmax_rows (not yet solved)
-# TODO: implement
+# Step 10 - softmax_rows
+__global__ void softmax_rows(float* matrix, int rows, int cols) {
+    // TODO: implement numerically stable row-wise softmax in place
+    int gid = blockIdx.x*blockDim.x + threadIdx.x;
+    // int stride = ;
+    if (gid < rows) {
+        // 定位当前行的起始指针，让代码更清爽，减少冗余的乘法计算
+        float* row_ptr = matrix + gid * cols;
+        
+        // 1. 第一趟：寻找当前行的最大值 max_num
+        float max_num = row_ptr[0];
+        for (int c = 1; c < cols; ++c) {
+            if (row_ptr[c] > max_num) {
+                max_num = row_ptr[c];
+            }
+        }
+        
+        // 2. 第二趟：计算数值稳定的指数和 sum
+        float sum = 0.0f;
+        for (int c = 0; c < cols; ++c) {
+            sum += expf(row_ptr[c] - max_num);
+        }
+        
+        // 3. 第三趟：计算最终的 Softmax 并原地 (in-place) 写回
+        for (int c = 0; c < cols; ++c) {
+            row_ptr[c] = expf(row_ptr[c] - max_num) / sum;
+        }
+    }
+}
 
 # Step 11 - pv_matmul (not yet solved)
 # TODO: implement
