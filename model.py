@@ -192,8 +192,52 @@ __global__ void pv_matmul(const float* p, const float* v, float* out, int seq_le
     }
 }
 
-# Step 12 - naive_attention (not yet solved)
-# TODO: implement
+# Step 12 - naive_attention
+void naive_attention(const float* d_q, const float* d_k, const float* d_v, float* d_out, int seq_len, int head_dim) {
+    // TODO: allocate scratch, launch qk_scores -> softmax_rows -> pv_matmul, free scratch
+    float* d_p = nullptr;
+    
+    // 1. Allocate scratch space for the attention scores / probabilities.
+    // Dimensions: [seq_len, seq_len]
+    size_t p_size = (size_t)seq_len * seq_len * sizeof(float);
+    cudaError_t err = cudaMalloc(&d_p, p_size);
+    if (err != cudaSuccess) {
+        // 在生产环境中应当有更好的错误处理机制
+        return;
+    }
+
+    // 2. Launch qk_scores: computes d_p = (Q @ K^T) / sqrt(head_dim)
+    // Q is [seq_len, head_dim], K is [seq_len, head_dim]
+    // Output d_p is [seq_len, seq_len]
+    dim3 block_qk(16, 16);
+    dim3 grid_qk((seq_len + block_qk.x - 1) / block_qk.x, 
+                 (seq_len + block_qk.y - 1) / block_qk.y);
+    
+    qk_scores<<<grid_qk, block_qk>>>(d_q, d_k, d_p, seq_len, head_dim);
+
+    // 3. Launch softmax_rows: computes row-wise softmax on d_p in-place
+    // Each row of d_p is independent. 
+    // 假设这是一个简单的 1D kernel，每个线程（或每个 Block）处理一行数据
+    int threads_per_block = 256;
+    int blocks_per_grid = (seq_len + threads_per_block - 1) / threads_per_block;
+    
+    softmax_rows<<<blocks_per_grid, threads_per_block>>>(d_p, seq_len,seq_len);
+
+    // 4. Launch pv_matmul: computes d_out = d_p @ V
+    // d_p is [seq_len, seq_len], V is [seq_len, head_dim]
+    // Output d_out is [seq_len, head_dim]
+    dim3 block_pv(16, 16);
+    dim3 grid_pv((head_dim + block_pv.x - 1) / block_pv.x, 
+                 (seq_len + block_pv.y - 1) / block_pv.y);
+                 
+    pv_matmul<<<grid_pv, block_pv>>>(d_p, d_v, d_out, seq_len, head_dim);
+
+    // 等待所有 Kernel 执行完毕（如果需要严格同步或计时可以加上）
+    // cudaDeviceSynchronize();
+
+    // 5. Free scratch memory
+    cudaFree(d_p);
+}
 
 # Step 13 - online_max (not yet solved)
 # TODO: implement
