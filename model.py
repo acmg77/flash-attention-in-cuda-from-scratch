@@ -269,8 +269,29 @@ __device__ void rescale_output(float* out_row, int head_dim, float correction) {
     
 }
 
-# Step 17 - load_tile (not yet solved)
-# TODO: implement
+# Step 17 - load_tile
+__device__ void load_tile(const float* src, float* shared_dst,
+                          int src_row_start, int src_col_start,
+                          int src_rows, int src_cols,
+                          int tile_rows, int tile_cols,
+                          int thread_id, int num_threads) {
+    // TODO: cooperatively copy the tile into shared_dst, zero-filling out-of-bounds positions.
+    int total_elements = tile_rows * tile_cols;
+    for(int i = thread_id;i<total_elements;i+=num_threads){
+        int matrix_row = i/tile_cols;
+        int matrix_col = i%tile_cols;
+
+        int global_row = src_row_start+matrix_row;
+        int global_col = src_col_start+matrix_col;
+
+        if(global_col<src_cols&&global_row<src_rows){
+            shared_dst[matrix_col+matrix_row*tile_cols] = src[global_col+global_row*src_cols];
+        }else{
+            shared_dst[matrix_col+matrix_row*tile_cols] = 0.0f;
+        }
+    }
+    
+}
 
 # Step 18 - tile_scores (not yet solved)
 # TODO: implement
