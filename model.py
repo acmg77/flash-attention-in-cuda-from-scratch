@@ -313,8 +313,26 @@ __device__ void tile_scores(const float* q_tile, const float* k_tile, float* s_t
     }
 }
 
-# Step 19 - tile_rowmax (not yet solved)
-# TODO: implement
+# Step 19 - tile_rowmax
+__device__ void tile_rowmax(const float* s_tile, float* row_max_out, int tile_q, int tile_k, int thread_id, int num_threads) {
+    // TODO: write row_max_out[r] = max over c of s_tile[r, c]
+    for (int row = thread_id; row < tile_q; row += num_threads) {
+        
+        // 1. 初始化最大值为极小值（防止分数全为负数的情况）
+        float max_val = -1e38f; 
+        
+        // 2. 当前线程独自遍历它所负责的这行的所有列
+        for (int col = 0; col < tile_k; ++col) {
+            float val = s_tile[row * tile_k + col];
+            if (val > max_val) {
+                max_val = val;
+            }
+        }
+        
+        // 3. 将这一行求出的最大值，安全地写入输出数组
+        row_max_out[row] = max_val;
+    }
+}
 
 # Step 20 - tile_exp (not yet solved)
 # TODO: implement
