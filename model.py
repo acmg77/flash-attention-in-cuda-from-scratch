@@ -788,8 +788,83 @@ __global__ void flash_attention_kernel(
     }
 }
 
-# Step 24 - flash_attention_launcher (not yet solved)
-# TODO: implement
+# Step 24 - flash_attention_launcher
+void flash_attention_launcher(
+    const float* d_q,
+    const float* d_k,
+    const float* d_v,
+    float* d_out,
+    int seq_len,
+    int head_dim,
+    int tile_q,
+    int tile_k
+) {
+    if (seq_len <= 0 || head_dim <= 0 ||
+        tile_q <= 0 || tile_k <= 0) {
+        return;
+    }
+
+    // 一个 block 负责一个 Q tile
+    const int num_blocks =
+        (seq_len + tile_q - 1) / tile_q;
+
+    // 所有辅助函数通过 thread_id / num_threads 协作处理数据
+    const int num_threads = 256;
+
+    /*
+     * Shared-memory layout:
+     *
+     * q_tile:       tile_q * head_dim
+     * k_tile:       tile_k * head_dim
+     * v_tile:       tile_k * head_dim
+     * p_tile:       tile_q * tile_k
+     * out_acc:      tile_q * head_dim
+     * running_max:  tile_q
+     * running_sum:  tile_q
+     * block_stat:   tile_q
+     * block_sum:    tile_q
+     */
+    const size_t shared_float_count =
+        static_cast<size_t>(tile_q) * head_dim +
+        static_cast<size_t>(tile_k) * head_dim +
+        static_cast<size_t>(tile_k) * head_dim +
+        static_cast<size_t>(tile_q) * tile_k +
+        static_cast<size_t>(tile_q) * head_dim +
+        static_cast<size_t>(4) * tile_q;
+
+    const size_t shared_bytes =
+        shared_float_count * sizeof(float);
+
+    const float scale =
+        1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    flash_attention_kernel<<<
+        num_blocks,
+        num_threads,
+        shared_bytes
+    >>>(
+        d_q,
+        d_k,
+        d_v,
+        d_out,
+        seq_len,
+        head_dim,
+        tile_q,
+        tile_k,
+        scale
+    );
+
+    // 检查 kernel 启动参数等同步前错误
+    cudaError_t error = cudaGetLastError();
+
+    if (error != cudaSuccess) {
+        fprintf(
+            stderr,
+            "flash_attention_kernel launch failed: %s\n",
+            cudaGetErrorString(error)
+        );
+    }
+}
 
 # Step 25 - causal_mask (not yet solved)
 # TODO: implement
