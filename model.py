@@ -390,8 +390,403 @@ __device__ void accumulate_pv(const float* p_tile, const float* v_tile, float* o
     }
 }
 
-# Step 23 - flash_attention_kernel (not yet solved)
-# TODO: implement
+# Step 23 - flash_attention_kernel
+__global__ void flash_attention_kernel(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* out,
+    int seq_len,
+    int head_dim,
+    int tile_q,
+    int tile_k,
+    float scale
+) {
+    extern __shared__ float shared_mem[];
+
+    const int thread_id = threadIdx.x;
+    const int num_threads = blockDim.x;
+
+    // 一个 block 处理一个 Q tile
+    const int q_start = blockIdx.x * tile_q;
+
+    const int remaining_q = seq_len - q_start;
+    const int valid_q =
+        remaining_q < tile_q ? remaining_q : tile_q;
+
+    if (valid_q <= 0) {
+        return;
+    }
+
+    // ============================================================
+    // Shared memory layout
+    // ============================================================
+
+    float* q_tile = shared_mem;
+    // [tile_q, head_dim]
+
+    float* k_tile =
+        q_tile + tile_q * head_dim;
+    // [tile_k, head_dim]
+
+    float* v_tile =
+        k_tile + tile_k * head_dim;
+    // [tile_k, head_dim]
+
+    float* p_tile =
+        v_tile + tile_k * head_dim;
+    // [tile_q, tile_k]
+    // 先存 score，之后原地变为 exp(score - row_max)
+
+    float* out_acc =
+        p_tile + tile_q * tile_k;
+    // [tile_q, head_dim]
+
+    float* running_max =
+        out_acc + tile_q * head_dim;
+    // [tile_q]
+
+    float* running_sum =
+        running_max + tile_q;
+    // [tile_q]
+
+    float* block_stat =
+        running_sum + tile_q;
+    // [tile_q]
+    // 先保存当前 block max，之后复用为 correction
+
+    float* block_sum =
+        block_stat + tile_q;
+    // [tile_q]
+
+    // ============================================================
+    // 1. 加载当前 Q tile
+    // ============================================================
+
+    load_tile(
+        q,
+        q_tile,
+        q_start,       // src_row_start
+        0,             // src_col_start
+        seq_len,       // src_rows
+        head_dim,      // src_cols
+        tile_q,        // tile_rows
+        head_dim,      // tile_cols
+        thread_id,
+        num_threads
+    );
+
+    // 初始化输出累加器
+    for (int index = thread_id;
+         index < tile_q * head_dim;
+         index += num_threads) {
+
+        out_acc[index] = 0.0f;
+    }
+
+    // 初始化 online softmax 状态
+    for (int row = thread_id;
+         row < tile_q;
+         row += num_threads) {
+
+        if (row < valid_q) {
+            running_max[row] = -INFINITY;
+            running_sum[row] = 0.0f;
+        } else {
+            // 无效 Q 行只用于填充，避免后续产生 NaN
+            running_max[row] = 0.0f;
+            running_sum[row] = 1.0f;
+        }
+
+        block_stat[row] = 0.0f;
+        block_sum[row] = 0.0f;
+    }
+
+    __syncthreads();
+
+    // ============================================================
+    // 2. 遍历所有 K/V tiles
+    // ============================================================
+
+    for (int kv_start = 0;
+         kv_start < seq_len;
+         kv_start += tile_k) {
+
+        const int remaining_k = seq_len - kv_start;
+        const int valid_k =
+            remaining_k < tile_k ? remaining_k : tile_k;
+
+        // --------------------------------------------------------
+        // 2.1 加载 K tile
+        // --------------------------------------------------------
+
+        load_tile(
+            k,
+            k_tile,
+            kv_start,      // src_row_start
+            0,             // src_col_start
+            seq_len,       // src_rows
+            head_dim,      // src_cols
+            tile_k,        // tile_rows
+            head_dim,      // tile_cols
+            thread_id,
+            num_threads
+        );
+
+        // --------------------------------------------------------
+        // 2.2 加载 V tile
+        // --------------------------------------------------------
+
+        load_tile(
+            v,
+            v_tile,
+            kv_start,
+            0,
+            seq_len,
+            head_dim,
+            tile_k,
+            head_dim,
+            thread_id,
+            num_threads
+        );
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // 2.3 计算当前分块的 score
+        //
+        // P_tile = scale * Q_tile @ K_tile^T
+        // --------------------------------------------------------
+
+        tile_scores(
+            q_tile,
+            k_tile,
+            p_tile,
+            tile_q,
+            tile_k,
+            head_dim,
+            scale,
+            thread_id,
+            num_threads
+        );
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // 2.4 屏蔽最后一个不完整 tile 的无效位置
+        //
+        // load_tile 对越界 K 补零，但对应 score 会变成 0。
+        // softmax 中这些位置必须是 -inf，不能是 0。
+        // --------------------------------------------------------
+
+        const int score_elements = tile_q * tile_k;
+
+        for (int index = thread_id;
+             index < score_elements;
+             index += num_threads) {
+
+            const int row = index / tile_k;
+            const int col = index % tile_k;
+
+            if (row >= valid_q || col >= valid_k) {
+                p_tile[index] = -INFINITY;
+            }
+        }
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // 2.5 当前 score tile 的逐行最大值
+        // --------------------------------------------------------
+
+        tile_rowmax(
+            p_tile,
+            block_stat,
+            tile_q,
+            tile_k,
+            thread_id,
+            num_threads
+        );
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // 2.6 更新 running max，并计算 correction
+        //
+        // new_max = max(old_max, block_max)
+        // correction = exp(old_max - new_max)
+        //
+        // block_stat 原本保存 block_max，
+        // 这里覆盖为 correction。
+        // --------------------------------------------------------
+
+        for (int row = thread_id;
+             row < tile_q;
+             row += num_threads) {
+
+            if (row < valid_q) {
+                const float old_max =
+                    running_max[row];
+
+                const float block_max =
+                    block_stat[row];
+
+                const float new_max =
+                    online_max(old_max, block_max);
+
+                const float correction =
+                    correction_factor(old_max, new_max);
+
+                running_max[row] = new_max;
+                block_stat[row] = correction;
+            } else {
+                block_stat[row] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // 2.7 按行重新缩放历史输出
+        //
+        // out_acc[row] *= correction[row]
+        //
+        // rescale_output 的签名是：
+        // rescale_output(float* out_row,
+        //                int head_dim,
+        //                float correction)
+        // --------------------------------------------------------
+
+        for (int row = thread_id;
+             row < valid_q;
+             row += num_threads) {
+
+            rescale_output(
+                out_acc + row * head_dim,
+                head_dim,
+                block_stat[row]
+            );
+        }
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // 2.8 计算当前 tile 的未归一化 softmax
+        //
+        // p_tile[row, col] =
+        //     exp(score[row, col] - running_max[row])
+        // --------------------------------------------------------
+
+        tile_exp(
+            p_tile,
+            running_max,
+            tile_q,
+            tile_k,
+            thread_id,
+            num_threads
+        );
+
+        __syncthreads();
+
+        // invalid K 列原本是 -inf，经过 exp 后自然为 0。
+        // invalid Q 行也显式清零，避免依赖 inf 运算行为。
+        for (int index = thread_id;
+             index < score_elements;
+             index += num_threads) {
+
+            const int row = index / tile_k;
+
+            if (row >= valid_q) {
+                p_tile[index] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // 2.9 求当前 P tile 的逐行和
+        // --------------------------------------------------------
+
+        tile_rowsum(
+            p_tile,
+            block_sum,
+            tile_q,
+            tile_k,
+            thread_id,
+            num_threads
+        );
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // 2.10 更新 online softmax 分母
+        //
+        // new_sum =
+        //     old_sum * correction + block_sum
+        //
+        // 参数顺序必须是：
+        // update_running_sum(old_sum, correction, block_sum)
+        // --------------------------------------------------------
+
+        for (int row = thread_id;
+             row < valid_q;
+             row += num_threads) {
+
+            running_sum[row] =
+                update_running_sum(
+                    running_sum[row],
+                    block_stat[row],
+                    block_sum[row]
+                );
+        }
+
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // 2.11 累加 P tile @ V tile
+        //
+        // out_acc += p_tile @ v_tile
+        //
+        // 历史 out_acc 已经在前面乘过 correction。
+        // --------------------------------------------------------
+
+        accumulate_pv(
+            p_tile,
+            v_tile,
+            out_acc,
+            tile_q,
+            tile_k,
+            head_dim,
+            thread_id,
+            num_threads
+        );
+
+        // 下一轮将覆盖 k_tile、v_tile、p_tile，
+        // 必须确保当前所有线程已经使用完成。
+        __syncthreads();
+    }
+
+    // ============================================================
+    // 3. 最终归一化并写回
+    //
+    // out = out_acc / running_sum
+    // ============================================================
+
+    const int valid_output_elements =
+        valid_q * head_dim;
+
+    for (int index = thread_id;
+         index < valid_output_elements;
+         index += num_threads) {
+
+        const int row = index / head_dim;
+        const int col = index % head_dim;
+
+        out[(q_start + row) * head_dim + col] =
+            out_acc[row * head_dim + col] /
+            running_sum[row];
+    }
+}
 
 # Step 24 - flash_attention_launcher (not yet solved)
 # TODO: implement
